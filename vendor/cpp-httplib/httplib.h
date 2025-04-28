@@ -1500,6 +1500,7 @@ private:
   size_t max_thread_count_;
   size_t max_queued_requests_;
   size_t idle_thread_count_;
+  uint64_t cpumask_;
 
   bool shutdown_;
 

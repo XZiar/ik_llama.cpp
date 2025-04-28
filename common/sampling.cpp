@@ -3,7 +3,7 @@
 #include "llama-vocab.h"
 #include "common.h"
 #include "speculative.h"
-#include "reasoning-budget.cpp"
+#include "reasoning-budget.h"
 
 #include <limits>
 #include <random>

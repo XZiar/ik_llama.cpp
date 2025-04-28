@@ -446,6 +446,7 @@ struct gpt_params {
     bool infill            = false; // use infill mode
     bool dump_kv_cache     = false; // dump the KV cache contents for debugging purposes
     bool no_kv_offload     = false; // disable KV offloading
+    bool pipeline_para     = false; // disable pipeline parallel
     bool warmup            = true;  // warmup run
     bool batch_warmup      = false; // batch warmup run
     bool check_tensors     = false; // validate tensor data

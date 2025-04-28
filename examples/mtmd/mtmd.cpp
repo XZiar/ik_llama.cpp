@@ -168,7 +168,7 @@ struct mtmd_context {
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
             /* verbosity         */ ctx_params.verbosity,
-            /* flash_attn_type   */ CLIP_FLASH_ATTN_TYPE_DISABLED,
+            /* flash_attn_type   */ CLIP_FLASH_ATTN_TYPE_AUTO,
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
             /* kq_type           */ ctx_params.kq_type,

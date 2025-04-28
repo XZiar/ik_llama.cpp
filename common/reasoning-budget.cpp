@@ -56,7 +56,7 @@ static const char * common_reasoning_budget_name(const common_reasoning_budget_c
     return "reasoning-budget";
 }
 
-static void common_reasoning_budget_accept(common_reasoning_budget_ctx * smpl, llama_token token) {
+void common_reasoning_budget_accept(common_reasoning_budget_ctx * smpl, llama_token token) {
     auto * ctx = (common_reasoning_budget_ctx *)smpl;
 
     switch (ctx->state) {
@@ -140,7 +140,7 @@ static void common_reasoning_budget_accept(common_reasoning_budget_ctx * smpl, l
     }
 }
 
-static void common_reasoning_budget_apply(struct common_reasoning_budget_ctx * smpl, llama_token_data_array * cur_p) {
+void common_reasoning_budget_apply(struct common_reasoning_budget_ctx * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *)smpl;
     if (!ctx) {
         return;
@@ -179,12 +179,12 @@ static struct common_reasoning_budget_ctx * common_reasoning_budget_init_state(
     const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
     int32_t budget, common_reasoning_budget_state initial_state);
 
-static struct common_reasoning_budget_ctx * common_reasoning_budget_clone(const struct common_reasoning_budget_ctx * smpl) {
+struct common_reasoning_budget_ctx * common_reasoning_budget_clone(const struct common_reasoning_budget_ctx * smpl) {
     const auto * ctx = (const common_reasoning_budget_ctx *)smpl;
     return new common_reasoning_budget_ctx(*ctx);
 }
 
-static void common_reasoning_budget_free(struct common_reasoning_budget_ctx * smpl) {
+void common_reasoning_budget_free(struct common_reasoning_budget_ctx * smpl) {
     delete (common_reasoning_budget_ctx *)smpl;
 }
 

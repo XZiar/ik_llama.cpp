@@ -179,6 +179,17 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr)
     {
         err = cudaMallocManaged(ptr, size);
+        if (err == cudaSuccess)
+        {
+            cudaMemLocation loc { cudaMemLocationTypeDevice, device };
+#if CUDART_VERSION >= 13000
+#   define _cmadv cudaMemAdvise
+#else
+#   define _cmadv cudaMemAdvise_v2
+#endif
+            CUDA_CHECK(_cmadv(*ptr, size, cudaMemAdviseSetReadMostly, loc));
+#undef _cmadv
+        }
     }
     else
     {
@@ -1555,8 +1566,10 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
         },
         /* .context  = */ nullptr,
     };
-
-    return &ggml_backend_cuda_buffer_type_host;
+    if (ggml_backend_cuda_get_device_count() == 0)
+        return nullptr;
+    else
+        return &ggml_backend_cuda_buffer_type_host;
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {

@@ -378,6 +378,8 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string ref_file;
+    std::string chat_template_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<CustomQ> custom_quants;
@@ -504,6 +506,18 @@ int main(int argc, char ** argv) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
+        } else if (strcmp(argv[arg_idx], "--ref") == 0) {
+            if (arg_idx < argc-1) {
+                ref_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--chat-template") == 0) {
+            if (arg_idx < argc-1) {
+                chat_template_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
@@ -605,6 +619,18 @@ int main(int argc, char ** argv) {
             kv_overrides.emplace_back(std::move(kvo));
         }
     }
+    if (!chat_template_file.empty()) {
+        if (chat_template_file.size() > 120) {
+            printf("%s: chat_template_file path too long: %s\n",__func__, chat_template_file.c_str());
+            exit(1);
+        }
+        llama_model_kv_override kvo;
+        std::strcpy(kvo.key, "tokenizer.chat_template");
+        kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+        strncpy(kvo.val_str, chat_template_file.c_str(), 127);
+        kvo.val_str[127] = '\0';
+        kv_overrides.emplace_back(std::move(kvo));
+    }
     if (!kv_overrides.empty()) {
         kv_overrides.emplace_back();
         kv_overrides.back().key[0] = 0;
@@ -701,7 +727,7 @@ int main(int argc, char ** argv) {
     {
         const int64_t t_start_us = llama_time_us();
 
-        if (llama_model_quantize(fname_inp.c_str(), fname_out.c_str(), &params)) {
+        if (llama_model_quantize_ref(fname_inp.c_str(), fname_out.c_str(), ref_file.empty() ? nullptr : ref_file.c_str(), &params)) {
             fprintf(stderr, "%s: failed to quantize model from '%s'\n", __func__, fname_inp.c_str());
             return 1;
         }

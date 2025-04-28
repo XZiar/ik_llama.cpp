@@ -14420,7 +14420,36 @@ static void quantize_row_iq1_s_impl(const float * restrict x, void * restrict vy
         for (int ib = 0; ib < QK_K/block_size; ++ib) {
             const float * xb = xbl + block_size*ib;
             const float * qw = quant_weights + QK_K*ibl + block_size*ib;
-            for (int i = 0; i < block_size; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
+            float max_w = 0;
+            float bsumx2 = 0;
+            for (int i = 0; i < block_size; ++i) {
+                float x2 = xb[i]*xb[i];
+                bsumx2 += x2;
+                weight[i] = qw[i] * sqrtf(sigma2 + x2);
+                max_w = MAX(max_w, weight[i]);
+            }
+            // All-zero block: store the all-zero grid entry (index 1029 in the IQ1_S grid)
+            if (bsumx2 < 1e-14f) {
+                scales[ib] = 0;
+                shifts[ib] = 1;
+                uint16_t h = 0;
+                for (int k = 0; k < block_size/8; ++k) {
+                    index[k] = 1029;
+                    y[ibl].qs[(block_size/8)*ib + k] = index[k] & 255;
+                    h |= (index[k] >> 8) << 3*k;
+                }
+                y[ibl].qh[ib] = h;
+                continue;
+            }
+            if (max_w <= 0.f) {
+                // The imatrix is (effectively) zero in this block: fall back to
+                // weights based on the data alone, as done in quantize_iq1_s_r4()
+                // when the imatrix is missing or invalid.
+                for (int i = 0; i < block_size; ++i) {
+                    weight[i] = sqrtf(sigma2 + xb[i]*xb[i]);
+                    max_w = MAX(max_w, weight[i]);
+                }
+            }
             int best_shift;
             iq1s_process_1block(block_size, xb, weight, L, &scales[ib], index, &best_shift, pairs, sumx, sumw);
 
@@ -14682,27 +14711,29 @@ static void quantize_row_iq1_m_impl(const float * restrict x, void * restrict vy
         for (int ib = 0; ib < QK_K/block_size; ++ib) {
             float sigma2 = all_sigma2[ib/2];
             const float * xb = xbl + block_size*ib;
-            if (quant_weights) {
-                const float * qw = quant_weights + QK_K*ibl + block_size*ib;
-                for (int i = 0; i < block_size; ++i) weight[i] = qw[i] * sqrtf(sigma2 + xb[i]*xb[i]);
-            } else {
-                for (int i = 0; i < block_size; ++i) weight[i] = xb[i]*xb[i];
+            const float * qw = quant_weights ? quant_weights + QK_K*ibl + block_size*ib : NULL;
+            float bsumx2 = 0;
+            for (int i = 0; i < block_size; ++i) {
+                float x2 = xb[i]*xb[i];
+                bsumx2 += x2;
+                weight[i] = qw ? qw[i] * sqrtf(sigma2 + x2) : x2;
             }
-            float max = fabsf(xb[0]);
-            float sumwx = 0;
-            for (int i = 1; i < block_size; ++i) {
-                float ax = fabsf(xb[i]);
-                max = MAX(max, ax);
-                sumwx += weight[i]*ax;
-            }
-            if (max < GROUP_MAX_EPS_IQ1_M) {
+            if (bsumx2 < GROUP_MAX_EPS_IQ1_M * GROUP_MAX_EPS_IQ1_M) {
+                // All-zero (or near-zero) block: store the all-zero grid entry (index 1029
+                // in the IQ1_S grid) with a zero scale and no shift, same as in quantize_iq1_m_r4().
                 scales[ib] = 0;
-                memset(L, 1, block_size);
+                shifts[ib] = 0;
+                y[ibl].qs[2*ib + 0] = 1029 & 255;
+                y[ibl].qs[2*ib + 1] = 1029 & 255;
+                y[ibl].qh[ib] = (1029 >> 8) | ((1029 >> 8) << 4);
                 continue;
             }
-            if (sumwx == 0) {
-                // weight is zero everywhere where xb is not zero => ignore
-                for (int i = 0; i < block_size; ++i) weight[i] = xb[i]*xb[i];
+            float sumwx = 0;
+            for (int i = 0; i < block_size; ++i) sumwx += weight[i]*fabsf(xb[i]);
+            if (sumwx < GROUP_MAX_EPS_IQ1_M) {
+                // weight is zero everywhere where xb is not zero => fall back to
+                // weights based on the data alone, as done in quantize_iq1_m_r4()
+                for (int i = 0; i < block_size; ++i) weight[i] = sqrtf(sigma2 + xb[i]*xb[i]);
             }
 
             int best_k = -1;

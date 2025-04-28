@@ -1814,6 +1814,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.dump_kv_cache = true;
         return true;
     }
+    if (arg == "--pipeline-parallel") {
+        params.pipeline_para = true;
+        return true;
+    }
     if (arg == "-nkvo" || arg == "--no-kv-offload") {
         params.no_kv_offload = true;
         return true;

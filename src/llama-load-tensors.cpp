@@ -16,6 +16,8 @@
 
 struct create_tensors_helper : public create_tensors_helper_interface {
 
+    std::map<std::string, std::pair<const ggml_tensor*, ggml_backend_buffer_type_t>> overrideList;
+
     create_tensors_helper(llama_model_loader & ml, llama_model & model);
     ~create_tensors_helper() = default;
 
@@ -467,7 +469,8 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
             if (o.second == default_cpu_buft) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
-            LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
+            // LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
+            overrideList.try_emplace(name, cur, o.second);
             ctx = ctx_for_buft(o.second);
             break;
         }
@@ -5988,6 +5991,122 @@ bool create_tensors_helper::create_tensors() {
             LLAMA_LOG_INFO("    Device %d:  %8.2f MiB\n", i, mem_used[i]/1024./1024.);
         }
     }
+
+    struct TensorPack
+    {
+        size_t TotalBytes = 0;
+        struct RepeatedTensors
+        {
+            std::vector<uint32_t> LayerIds;
+            std::map<ggml_type, std::pair<std::vector<uint32_t>, size_t>> Types;
+        };
+        std::map<std::string_view, RepeatedTensors> Repeated;
+        std::vector<std::tuple<const std::string*, ggml_type, size_t>> NonRepeated;
+        void Put(const std::string& name, const ggml_tensor* tensor) noexcept
+        {
+            const auto bytes = ggml_nbytes(tensor);
+            TotalBytes += bytes;
+            constexpr std::string_view prefix = "blk.";
+            if (name.size() > prefix.size() && std::char_traits<char>::compare(name.data(), prefix.data(), prefix.size()) == 0)
+            {
+                uint32_t numCnt = 0;
+                auto it = name.cbegin() + 4;
+                const auto itend = name.cend(); 
+                while (it != itend)
+                {
+                    if (*it >= '0' && *it <= '9')
+                    {
+                        numCnt++;
+                        it++;
+                        continue;
+                    }
+                    else if (*it == '.')
+                        it++;
+                    else
+                        it = itend;
+                    break;
+                }
+                if (numCnt > 0 && it != itend)
+                {
+                    const std::string_view suffix(&*it, itend - it);
+                    auto& tensors = Repeated[suffix];
+                    const uint32_t id = std::atoi(name.data() + 4);
+                    tensors.LayerIds.push_back(id);
+                    auto& [ids, size] = tensors.Types[tensor->type];
+                    ids.push_back(id), size += bytes;
+                    return;
+                }
+            }
+            NonRepeated.emplace_back(&name, tensor->type, bytes);
+        }
+    };
+    const auto putRegion = [](std::string& dst, auto i, auto j) noexcept
+    {
+        if(!dst.empty())
+            dst.append(", ");
+        dst.append(std::to_string(i));
+        if (i != j)
+            dst.append("-").append(std::to_string(j));
+    };
+
+    std::map<ggml_backend_buffer_type_t, TensorPack> overrideLookup;
+    for (const auto& [name, info] : overrideList)
+        overrideLookup[info.second].Put(name, info.first);
+    for (auto& [dev, pack] : overrideLookup)
+    {
+        LLAMA_LOG_INFO("tensor [%zu MiB] overriden to %s:\n", pack.TotalBytes / 1024 / 1024, ggml_backend_buft_name(dev));
+        for (auto& [suffix, tensors] : pack.Repeated)
+        {
+            std::string ids;
+            {
+                std::sort(tensors.LayerIds.begin(), tensors.LayerIds.end());
+                uint32_t lastBegin = tensors.LayerIds[0];
+                uint32_t lastId = lastBegin;
+                for (auto it = tensors.LayerIds.begin() + 1; it != tensors.LayerIds.end(); ++it)
+                {
+                    if (*it == lastId + 1)
+                        lastId++;
+                    else
+                        putRegion(ids, lastBegin, lastId), lastBegin = lastId = *it;
+                }
+                putRegion(ids, lastBegin, lastId);
+            }
+            std::string typeSizes;
+            for (const auto& [t, v] : tensors.Types)
+            {
+                if (!typeSizes.empty())
+                    typeSizes.append(", ");
+                const auto& s = v.second;
+                typeSizes.append(ggml_type_name(t)).append(": ").append(std::to_string(s / 1024 / 1024)).append("MiB");
+            }
+            LLAMA_LOG_INFO("    blk.[X].%s: %s (%s)\n", suffix.data(), ids.c_str(), typeSizes.c_str());
+            if (tensors.Types.size() > 1)
+            {
+                for (auto& [t, v] : tensors.Types)
+                {
+                    std::string idsT;
+                    {
+                        std::sort(v.first.begin(), v.first.end());
+                        uint32_t lastBegin = v.first[0];
+                        uint32_t lastId = lastBegin;
+                        for (auto it = v.first.begin() + 1; it != v.first.end(); ++it)
+                        {
+                            if (*it == lastId + 1)
+                                lastId++;
+                            else
+                                putRegion(idsT, lastBegin, lastId), lastBegin = lastId = *it;
+                        }
+                        putRegion(idsT, lastBegin, lastId);
+                    }
+                    LLAMA_LOG_INFO("    -- %s: %s\n", ggml_type_name(t), idsT.c_str());
+                }
+            }
+        }
+        for (const auto& [name, t, s] : pack.NonRepeated)
+            LLAMA_LOG_INFO("    %s (%s: %zu MiB)\n", name->c_str(), ggml_type_name(t), s / 1024 / 1024);
+    }
+    overrideList.clear();
+
     return use_mmap_buffer;
 }
 

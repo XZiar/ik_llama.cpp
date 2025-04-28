@@ -10,9 +10,13 @@
 
 #include <thread>
 #include <regex>
+#include <map>
 #include <mutex>
 #include <fstream>
 #include <filesystem>
+#include <optional>
+#include <set>
+#include <vector>
 
 //
 // quantization
@@ -1025,7 +1029,7 @@ static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_t
     }
 }
 
-static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
+static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const char* fname_ref, const llama_model_quantize_params * params) {
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
 
@@ -1134,15 +1138,57 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     constexpr bool use_mmap = false;
 #endif
 
-    llama_model_kv_override * kv_overrides = nullptr;
+    static const std::string CHAT_TEMPLATE = "tokenizer.chat_template";
+    std::string chat_temp_override;
+    std::vector<llama_model_kv_override> kv_overrides;
     if (params->kv_overrides) {
         auto v = (std::vector<llama_model_kv_override>*)params->kv_overrides;
-        kv_overrides = v->data();
+        for (auto & o : *v) {
+            if (o.key == CHAT_TEMPLATE) {
+                if (o.tag != LLAMA_KV_OVERRIDE_TYPE_STR) {
+                    throw std::runtime_error("[tokenizer.chat_template] is not str!\n");
+                } else {
+                    LLAMA_LOG_INFO("override chat_template from %s\n", o.val_str);
+                    std::ifstream in(o.val_str, std::ios::binary);
+                    if (!in) {
+                        throw std::runtime_error(format("failed to open chat_template %s\n", o.val_str));
+                    }
+                    std::stringstream buffer;
+                    buffer << in.rdbuf();
+                    chat_temp_override = buffer.str();
+                }
+            } else {
+                kv_overrides.push_back(o);
+            }
+        }
     }
     llama_model_loader ml(fname_inp, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
             /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
-            /* defer_experts */ false, kv_overrides, nullptr);
+            /* defer_experts */ false, kv_overrides.data(), nullptr);
     ml.init_mappings(false); // no prefetching
+
+    std::vector<std::unique_ptr<llama_model_loader>> ml_refs;
+    if (fname_ref) {
+        std::string fnames = fname_ref;
+        auto pos = fnames.find('#'); 
+        while (pos != std::string::npos) {
+            auto fname0 = fnames.substr(0, pos);
+            printf("##loading ref [%s].\n", fname0.c_str());
+            fnames = fnames.substr(pos + 1);
+            pos = fnames.find('#');
+            auto& ml_ref = ml_refs.emplace_back(std::make_unique<llama_model_loader>(
+                fname0, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
+                /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
+                /* defer_experts */ false, /* kv_overrides */nullptr, nullptr));
+            ml_ref->init_mappings(false); // no prefetching
+        }
+        printf("##loading ref (%zu)[%s].\n", fnames.size(), fnames.c_str());
+        auto& ml_ref = ml_refs.emplace_back(std::make_unique<llama_model_loader>(
+            fnames, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
+            /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
+            /* defer_experts */ false, /* kv_overrides */nullptr, nullptr));
+        ml_ref->init_mappings(false); // no prefetching
+    }
 
     llama_model model;
     try {
@@ -1220,16 +1266,21 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             }
         }
     }
+    if (!chat_temp_override.empty()) {
+        gguf_set_val_str(ctx_out, CHAT_TEMPLATE.c_str(), chat_temp_override.c_str());
+    }
 
     bool is_repacked = ml.ftype >= LLAMA_FTYPE_MOSTLY_Q4_0_R8 && ml.ftype <= LLAMA_FTYPE_MOSTLY_Q8_K_R8;
     int n_to_repack = 0, n_to_modify = 0;
     const std::vector<std::string> * repack_pattern = nullptr;
     if (params->repack_pattern) repack_pattern = (const std::vector<std::string> *)params->repack_pattern;
 
+    std::set<std::string, std::less<>> in_tensor_names;
     for (int i = 0; i < ml.n_tensors; ++i) {
         const struct ggml_tensor * meta = ml.get_tensor_meta(i);
 
         const std::string name = ggml_get_name(meta);
+        in_tensor_names.insert(name);
 
         if (params->only_repack) {
             auto repacked_type = (ggml_type)iqk_repacked_type(meta);
@@ -1275,6 +1326,24 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 llama_model_ftype_name(ftype).c_str());
     }
 
+    std::map<std::string, std::pair<llama_model_loader*, int>> ref_tensors;
+    std::vector<std::tuple<std::string, llama_model_loader*, int>> ref_inject_tensors;
+    if (!ml_refs.empty()) {
+        for (const auto& ml_ref : ml_refs) {
+            for (int i = 0; i < ml_ref->n_tensors; ++i) {
+                const struct ggml_tensor * meta = ml_ref->get_tensor_meta(i);
+
+                const auto name = ggml_get_name(meta);
+                if (in_tensor_names.find(name) == in_tensor_names.end()) {
+                    ref_inject_tensors.emplace_back(name, ml_ref.get(), i);
+                    printf("Inject new tensor from ref: [%d] %s\n", i, name);
+                } else {
+                    ref_tensors[name] = std::pair{ml_ref.get(), i};
+                }
+            }
+        }
+    }
+
     gguf_set_val_u32(ctx_out, "general.file_type", ftype); // TODO: use LLM_KV
 
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)model.hparams.n_layer;
@@ -1286,12 +1355,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     //  - qs.n_attention_wv == 3 * model.hparams.n_layer for Encoder-Decoder models
     //  - model.arch == LLM_ARCH_DECI                    for Deci-Nemotron   models
     //
-    GGML_ASSERT((qs.n_attention_wv == 0 ||
+    if (!(qs.n_attention_wv == 0 ||
                  qs.n_attention_wv == (int)model.hparams.n_layer ||
                  qs.n_attention_wv == 3 * (int)model.hparams.n_layer ||
                  model.arch == LLM_ARCH_DECI ||
                  model.arch == LLM_ARCH_GEMMA4 ||
-                 model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
+                 model.arch == LLM_ARCH_UNKNOWN)) {
+        printf("n_attention_wv is unexpected\n");
+    }
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
@@ -1352,9 +1423,29 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
     }
 
+    for (const auto& [name, ml_ref, i] : ref_inject_tensors) {
+        auto weight = ml_ref->get_weight(i);
+        struct ggml_tensor * tensor = weight->tensor;
+        gguf_add_tensor(ctx_outs[0], tensor);
+    }
+
+    
+    std::string sel_pfx;
+    if (const auto sel_layer = std::getenv("selectlayer"); sel_layer) {
+        sel_pfx = "blk.";
+        sel_pfx += sel_layer;
+        sel_pfx += ".";
+    }
+    std::vector<int> main_ids;
     // populate the original tensors so we get an initial meta data
     for (int i = 0; i < ml.n_tensors; ++i) {
         auto weight = ml.get_weight(i);
+        if (!sel_pfx.empty()) {
+            std::string_view name = weight->tensor->name;
+            if (name.find(sel_pfx) != 0)
+                continue;
+        }
+        main_ids.push_back(i);
         uint16_t i_split = params->keep_split ? weight->idx : 0;
         struct ggml_tensor * tensor = weight->tensor;
         if (ctx_outs[i_split] == NULL) {
@@ -1382,6 +1473,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // Write metadata and close file handler
         if (fout.is_open()) {
             fout.seekp(0);
+            printf("now close [%d] : [%d]\n", cur_split, fout.rdstate());
             std::vector<uint8_t> data(gguf_get_meta_size(ctx_outs[cur_split]));
             gguf_get_meta_data(ctx_outs[cur_split], data.data());
             fout.write((const char *) data.data(), data.size());
@@ -1413,15 +1505,54 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         ensure_output_directory(fname);
         fout = std::ofstream(fname, std::ios::binary);
+        printf("now open [%d](%s) : [%d]\n", index, fname.c_str(), fout.rdstate());
         fout.exceptions(std::ofstream::failbit); // fail fast on write errors
         const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split]);
         // placeholder for the meta data
         ::zeros(fout, meta_size);
     };
 
+    size_t total = main_ids.size();
+
     const auto tn = LLM_TN(model.arch);
     new_ofstream(0);
-    for (int i = 0; i < ml.n_tensors; ++i) {
+
+    if (!ref_inject_tensors.empty() && !params->dry_run) {
+        total += ref_inject_tensors.size();
+        for (const auto& [name, ml_ref, i] : ref_inject_tensors) {
+            auto weight = ml_ref->get_weight(i);
+            struct ggml_tensor * tensor = weight->tensor;
+            
+            const auto new_size = ggml_nbytes(tensor);
+            if (!ml_ref->use_mmap) {
+                if (read_data.size() < new_size) {
+                    read_data.resize(new_size);
+                }
+                tensor->data = read_data.data();
+            }
+
+            LLAMA_LOG_INFO("[%4d/%4zu] %36s - [%s], type = %6s, Copied from ref (%8.2f)\n",
+                idx++, total,
+                ggml_get_name(tensor),
+                llama_format_tensor_shape(tensor).c_str(),
+                ggml_type_name(tensor->type), 
+                new_size/1024.f/1024.f);
+
+            ml_ref->load_data_for(tensor);
+            total_size_org += new_size;
+            total_size_new += new_size;
+
+            // update the gguf meta data as we go
+            gguf_set_tensor_type(ctx_outs[cur_split], name.c_str(), tensor->type);
+            gguf_set_tensor_data(ctx_outs[cur_split], name.c_str(), tensor->data, new_size);
+
+            // write tensor data + padding
+            fout.write((const char *) tensor->data, new_size);
+            zeros(fout, GGML_PAD(new_size, align) - new_size);
+        }
+    }
+
+    for (const auto i : main_ids) {
         auto weight = ml.get_weight(i);
         struct ggml_tensor * tensor = weight->tensor;
         if (weight->idx != cur_split && params->keep_split) {
@@ -1444,10 +1575,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             }
             tensor->data = read_data.data();
         }
-        ml.load_data_for(tensor);
 
-        LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, ",
-               ++idx, ml.n_tensors,
+        LLAMA_LOG_INFO("[%4d/%4zu] %36s - [%s], type = %6s, ",
+               ++idx, total,
                ggml_get_name(tensor),
                llama_format_tensor_shape(tensor).c_str(),
                ggml_type_name(tensor->type));
@@ -1499,6 +1629,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         size_t new_size = 0;
 
         if (params->only_repack) {
+            ml.load_data_for(tensor);
             ggml_type repacked_type = (ggml_type)iqk_repacked_type(tensor);
             bool modify = !is_repacked && iqk_should_modify_tensor(tensor);
             if ((modify || repacked_type != tensor->type) && repack_pattern) {
@@ -1616,6 +1747,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
 
         if (!quantize) {
+            ml.load_data_for(tensor);
             new_type = tensor->type;
             new_data = tensor->data;
             new_size = ggml_nbytes(tensor);
@@ -1661,7 +1793,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     }
                 }
                 if (it == imatrix_data->end()) {
-                    LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
+                    LLAMA_LOG_INFO("====== %s: did not find weights for %s\n", __func__, tensor->name);
                 } else {
                     if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
                         imatrix = it->second.data();
@@ -1711,12 +1843,32 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 chunk_size_multiplier = num_rows;
             }
 
-            LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+            if (const auto it = ref_tensors.find(name); it != ref_tensors.end() && !params->dry_run) {
+                const auto& [ml_ref, tidx] = it->second;
+                auto weight_ref = ml_ref->get_weight(tidx);
+                struct ggml_tensor * tensor_ref = weight_ref->tensor;
+                if (tensor_ref->type == new_type) {
+                    new_size = ggml_nbytes(tensor_ref);
+                    LLAMA_LOG_INFO("copy from ref with %s (%8.2f).. ", ggml_type_name(new_type), new_size/1024.f/1024.f);
+                    if (!ml_ref->use_mmap) {
+                        if (work.size() < new_size) {
+                            work.resize(new_size);
+                        }
+                        tensor_ref->data = work.data();
+                    }
+                    ml_ref->load_data_for(tensor_ref);
+                    new_data = tensor_ref->data;
+                }
+            }
+            if (!new_data) {
+                LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
+            }
             fflush(stdout);
 
             if (params->dry_run) {
                 new_size = tensor->ne[2] * tensor->ne[1] * ggml_row_size(new_type, tensor->ne[0]);
-            } else {
+            } else if (!new_data) {
+                ml.load_data_for(tensor);
                 float * f32_data;
 
                 if (tensor->type == GGML_TYPE_F32) {
@@ -1756,8 +1908,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                         LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", cur_size/1024.0/1024.0, cur_size/1024.0/1024.0);
                     }
 
-                    LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, ",
-                           ++idx, ml.n_tensors,
+                    LLAMA_LOG_INFO("[%4d/%4zu] %36s - [%s], type = %6s, ",
+                           ++idx, total,
                            ggml_get_name(tensor),
                            llama_format_tensor_shape(tensor).c_str(),
                            ggml_type_name(tensor->type));
@@ -1801,6 +1953,7 @@ QuantizationDone:;
         }
     }
     close_ofstream();
+
     for (auto & c:ctx_outs) {
         gguf_free(c);
     }
@@ -1818,9 +1971,19 @@ uint32_t llama_model_quantize(
         const char * fname_inp,
         const char * fname_out,
         const llama_model_quantize_params * params) {
+    return llama_model_quantize_ref(fname_inp, fname_out, nullptr, params);
+}
+
+uint32_t llama_model_quantize_ref(
+        const char * fname_inp,
+        const char * fname_out,
+        const char * fname_ref,
+        const llama_model_quantize_params * params) {
     try {
-        llama_model_quantize_internal(fname_inp, fname_out, params);
+        llama_model_quantize_internal(fname_inp, fname_out, fname_ref, params);
         return 0;
+    } catch (const std::ios_base::failure& e) {
+        LLAMA_LOG_ERROR("%s: failed to quantize: io failure[%d](%s)\n", __func__, e.code().value(), e.code().message().c_str());
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to quantize: %s\n", __func__, err.what());
         return 1;

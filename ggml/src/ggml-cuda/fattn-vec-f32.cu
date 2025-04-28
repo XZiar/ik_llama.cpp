@@ -1,6 +1,9 @@
 #include "fattn-vec-f32.cuh"
 #include "fattn-vec-f32-interface.cuh"
 
+DECL_FATTN_VEC_F32_CASE(256, GGML_TYPE_Q6_0, GGML_TYPE_Q6_0);
+DECL_FATTN_VEC_F32_CASE(256, GGML_TYPE_IQ4_NL,  GGML_TYPE_IQ4_NL);
+
 #define FATTN_VEC_F32_CASE(D, type_K, type_V)                               \
     if (Q->ne[0] == (D) && K->type == (type_K) && V->type == (type_V)) {    \
         ggml_cuda_flash_attn_ext_vec_f32_case<D, D, type_K, type_V>(ctx, dst); \
@@ -70,6 +73,8 @@ void ggml_cuda_flash_attn_ext_vec_f32(ggml_backend_cuda_context & ctx, ggml_tens
 
     FATTN_VEC_F32_CASE(256, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_VEC_F32_CASE(256, GGML_TYPE_Q8_0,GGML_TYPE_Q8_0)
+    FATTN_VEC_F32_CASE(256, GGML_TYPE_Q6_0,GGML_TYPE_Q6_0)
+    FATTN_VEC_F32_CASE(256, GGML_TYPE_IQ4_NL,GGML_TYPE_IQ4_NL)
 
     FATTN_VEC_F32_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
     FATTN_VEC_F32_CASE(128, GGML_TYPE_Q8_0,   GGML_TYPE_IQ4_NL)
@@ -132,7 +137,7 @@ bool ggml_cuda_fattn_vec_f32_is_supported([[maybe_unused]] ggml_backend_cuda_con
                V->type == GGML_TYPE_Q5_0 || V->type == GGML_TYPE_Q5_1 || V->type == GGML_TYPE_Q8_0);
     }
     if (K->ne[0] == 256) {
-        return K->type == V->type && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0);
+        return K->type == V->type && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q6_0 || K->type == GGML_TYPE_IQ4_NL);
     }
     if (K->ne[0] != 128 || V->ne[0] != 128) return false;
     if ((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q4_1 || K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1 ||

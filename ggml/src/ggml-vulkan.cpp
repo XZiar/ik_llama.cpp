@@ -3048,6 +3048,9 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
+    if (idx >= vk_instance.device_indices.size()) 
+        return {};
+    
     if (vk_instance.devices[idx] == nullptr) {
         VK_LOG_DEBUG("Initializing new vk_device");
         vk_device device = std::make_shared<vk_device_struct>();
@@ -3917,7 +3920,11 @@ static void ggml_vk_instance_init() {
             new_driver.pNext = &new_id;
             devices[i].getProperties2(&new_props);
 
-            if (new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+            if (std::string_view(new_props.properties.deviceName.data()).find("Direct3D12") != std::string_view::npos)
+                continue; // ignore VulkanOn12
+
+            if (new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu ||
+                new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) {
                 // Check if there are two physical devices corresponding to the same GPU
                 auto old_device = std::find_if(
                     vk_instance.device_indices.begin(),
@@ -10080,9 +10087,11 @@ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
 
     // Make sure device 0 is initialized
     ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    const auto dev = ggml_vk_get_device(0);
+    if (!dev)
+        return nullptr;
+    else
+        return &ggml_backend_vk_buffer_type_host;
 }
 
 
@@ -11002,7 +11011,7 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
     case VK_VENDOR_ID_INTEL:
         // Only allowing Xe2 GPU at the moment since Xe2 GPU can gain significant performance boost,
         // while some older hardware (ex. Arc A770) has performance regressions
-        return arch == vk_device_architecture::INTEL_XE2;
+        return arch == vk_device_architecture::INTEL_XE2 || props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
     case VK_VENDOR_ID_AMD:
         if (driver_props.driverID == vk::DriverId::eAmdProprietary || driver_props.driverID == vk::DriverId::eAmdOpenSource) {
             // Workaround for AMD proprietary driver reporting support on all GPUs

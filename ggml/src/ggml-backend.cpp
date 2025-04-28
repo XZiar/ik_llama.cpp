@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <map>
 #include <set>
 #include <array>
 #include <chrono>
@@ -1197,6 +1198,7 @@ struct ggml_backend_sched {
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
+    const char* summary_name = nullptr;
 
     bool only_active_experts;
     bool split_mode_graph;
@@ -1883,6 +1885,53 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
+    }
+
+    if (sched->summary_name)
+    {
+        std::map<ggml_backend_t, std::string> backendnames;
+        std::map<std::string_view, std::map<const char*, std::vector<const char*>>> assignments;
+        for (int i = 0; i < graph->n_nodes; i++) 
+        {
+            const auto node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) continue;
+            ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
+            std::string_view be;
+            if (const auto it = backendnames.find(tensor_backend); it == backendnames.end()) 
+            {
+                std::string_view name = tensor_backend ? ggml_backend_name(tensor_backend) : "";
+                auto& name_ = backendnames[tensor_backend];
+                for (const auto ch : name) 
+                    if (ch > '9' || ch < '0')
+                        name_.push_back(ch);
+                be = name_;
+            }
+            else
+            {
+                be = it->second;
+            }
+            auto& vec = assignments[be][ggml_op_name(node->op)];
+            vec.emplace_back(node->name);
+        }
+        for (const auto& [be, ops] : assignments)
+        {
+            printf("[%s]: [%s] ops(%zu):\n", sched->summary_name, be.data(), ops.size());
+            for (const auto& [op, names] : ops)
+            {
+                printf("--[%16s]", op);
+                if (names.size() > 4)
+                    printf(" (%zu)\n", names.size());
+                else
+                {
+                    printf(" [");
+                    for (const auto name : names) 
+                    {
+                        printf("%s, ", name);
+                    }
+                    printf("]\n");
+                }
+            }
+        }
     }
 
     // swap node_backend_ids and leaf _backend_ids with prevs
@@ -2639,6 +2688,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+void ggml_backend_sched_sumamry_name(ggml_backend_sched_t sched, const char* name) {
+    GGML_ASSERT(sched);
+    sched->summary_name = name;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

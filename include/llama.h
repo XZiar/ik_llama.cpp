@@ -738,6 +738,12 @@ extern "C" {
             const char * fname_out,
             const llama_model_quantize_params * params);
 
+    LLAMA_API uint32_t llama_model_quantize_ref(
+            const char * fname_inp,
+            const char * fname_ref,
+            const char * fname_out,
+            const llama_model_quantize_params * params);
+
     // Load a LoRA adapter from file
     // The loaded adapter will be associated to the given model, and will be free when the model is deleted
     LLAMA_API struct llama_lora_adapter * llama_lora_adapter_init(

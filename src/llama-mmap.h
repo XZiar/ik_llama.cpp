@@ -14,8 +14,10 @@ using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
 using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 
 struct llama_file {
-    llama_file(const char * fname, const char * mode);
+    llama_file(const char * fname, const char * mode, const bool use_direct_io = false);
     ~llama_file();
+
+    void hint(bool nocache, bool releasecache) const;
 
     size_t tell() const;
     size_t size() const;
@@ -24,7 +26,9 @@ struct llama_file {
 
     void seek(size_t offset, int whence) const;
 
+    void read_raw_at(void * ptr, size_t offset, size_t len) const;
     void read_raw(void * ptr, size_t len) const;
+    void read_raw_unsafe(void * ptr, size_t len) const;
     uint32_t read_u32() const;
 
     void write_raw(const void * ptr, size_t len) const;
@@ -33,6 +37,7 @@ struct llama_file {
 
     std::unique_ptr<llama_file> clone() const;
 
+    size_t read_alignment() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -63,6 +68,7 @@ struct llama_mlock {
 
     void init(void * ptr);
     void grow_to(size_t target_size);
+    bool lock_region(size_t offset, size_t size);
 
     static const bool SUPPORTED;
 

@@ -238,10 +238,10 @@ bool server_context::load_model(const gpt_params& params_) {
         mparams.image_max_tokens = params_base.image_max_tokens;
         mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
         if (mctx == nullptr) {
-            LOG_ERROR("failed to load multimodal model, %s\n", mmproj_path.c_str());
+            LOG_ERROR("failed to load multimodal model, %s", mmproj_path.c_str());
             return false;
         }
-        LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
+        LOG_INFO("loaded multimodal model, %s", mmproj_path.c_str());
 
         //if (params.n_cache_reuse) {
         //    params_base.n_cache_reuse = 0;
@@ -249,7 +249,7 @@ bool server_context::load_model(const gpt_params& params_) {
         //}
 
         if (has_draft_model) {
-            LOG_ERROR("%s\n", "err: speculative decode is not supported by multimodal");
+            LOG_ERROR("%s", "err: speculative decode is not supported by multimodal");
             return false;
         }
 
@@ -260,7 +260,7 @@ bool server_context::load_model(const gpt_params& params_) {
             params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
             params_base.speculative.stages.clear();
             params_base.has_mtp = false;
-            SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
+            SRV_WRN("%s", "speculative decoding is not supported by multimodal, it will be disabled");
         }
     }
 
@@ -3476,7 +3476,7 @@ void server_context::context_shift() {
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
                 const int32_t n_left = (int)system_tokens.size() + slot.n_past - n_keep;
-                int32_t n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
+                int32_t n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 16);
                 int32_t n_kept;
                 int32_t n_discard_cache;
                 adjust_n_to_support_context_shift(slot.cache_tokens, n_keep, n_discard);

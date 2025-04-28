@@ -27,6 +27,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstring>
+#include <chrono>
 
 #if defined(_WIN32)
     #define WIN32_LEAN_AND_MEAN
@@ -349,7 +350,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
     llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-    files.emplace_back(new llama_file(fname.c_str(), "rb"));
+    files.emplace_back(new llama_file(fname.c_str(), "rb", !use_mmap));
     contexts.emplace_back(ctx);
 
     // Save tensors data offset of the main file.
@@ -391,7 +392,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
                 throw std::runtime_error(format("%s: failed to load GGUF split from %s\n", __func__, split_path));
             }
 
-            files.emplace_back(new llama_file(split_path, "rb"));
+            files.emplace_back(new llama_file(split_path, "rb", !use_mmap));
             contexts.emplace_back(ctx);
 
             // Save tensors data offset info of the shard.
@@ -1013,15 +1014,21 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
+        mmaps_usages.reserve(files.size());
         for (const auto & file : files) {
             std::unique_ptr<llama_mmap> mapping(new llama_mmap(file.get(), prefetch ? -1 : 0, ggml_is_numa(), use_thp));
             mmaps_used.emplace_back(mapping->size(), 0);
+            mmaps_usages.emplace_back();
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+        }
+    } else {
+        for (const auto & file : files) {
+            file->hint(true, false);
         }
     }
 
@@ -1070,8 +1077,7 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
-        file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+        file->read_raw_at(cur->data, w.offs, ggml_nbytes(cur));
     }
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
@@ -1177,12 +1183,65 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    if (!lmlock->lock_region(weight->offs, n_size))
+                    {
+                        LLAMA_LOG_DEBUG("failed to lock region, fallabck to whole grow\n");
+                        lmlock->grow_to(weight->offs + n_size);
+                    }
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+
+                {
+                    auto & mmap_usages = mmaps_usages[weight->idx];
+                    size_t uidx = mmap_usages.size();
+                    while (uidx-- > 0)
+                    {
+                        auto& [off, size] = mmap_usages[uidx];
+                        if (off < weight->offs)
+                        {
+                            if (off + size >= weight->offs) // can combine left
+                            {
+                                //printf("--use[%10zu](%10zu), combine [%u][%10zu](%10zu)\n", weight->offs, n_size, uidx, off, size);
+                                size = weight->offs + n_size - off;
+                            }
+                            else // insert
+                            {
+                                //printf("--use[%10zu](%10zu), insert after [%u][%10zu](%10zu)\n", weight->offs, n_size, uidx, off, size);
+                                uidx++;
+                                mmap_usages.emplace(mmap_usages.begin() + uidx, weight->offs, n_size);
+                            }
+                            break;
+                        }
+                    }
+                    if (uidx == SIZE_MAX) // reach to begining
+                    {
+                        //printf("--use[%10zu](%10zu), insert beginning\n", weight->offs, n_size);
+                        mmap_usages.emplace(mmap_usages.begin(), weight->offs, n_size);
+                        uidx = 0;
+                    }
+                    // combine right
+                    auto uit = mmap_usages.begin() + uidx;
+                    auto right_bound = uit->first + uit->second;
+                    auto cit = uit + 1;
+                    //printf("@@(%12zu)[%u - %u in %zu](%c)\n", right_bound, uidx, std::distance(mmap_usages.begin(), cit), mmap_usages.size(), cit != mmap_usages.end() ? '`':'E');
+                    for (; cit != mmap_usages.end(); ++cit)
+                    {
+                        const auto& [off, size] = *cit;
+                        //printf("@@check(%12zu)(%10zu) at [%u]\n", off, size, std::distance(mmap_usages.begin(), cit));
+                        if (right_bound < off)
+                            break;
+                        right_bound = std::max(right_bound, off + size);
+                    }
+                    //printf("--combine[%10zu ~ %10zu](%10zu), combine [%zu ~ %zu](%zu)\n", uit->first, uit->first + uit->second, right_bound, uidx, std::distance(mmap_usages.begin(), cit), std::distance(uit, cit));
+                    if (std::distance(uit, cit) > 1)
+                    {
+                        uit->second = right_bound - uit->first;
+                        mmap_usages.erase(uit + 1, cit);
+                    }
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1191,8 +1250,11 @@ bool llama_model_loader::load_all_data(
 
         // host. Parallel.
         if (ggml_backend_buffer_is_host(cur->buffer)) {
-            file->seek(weight->offs, SEEK_SET);
-            file->read_raw(cur->data, n_size);
+            const auto tbegin = std::chrono::high_resolution_clock::now();
+            file->read_raw_at(cur->data, weight->offs, n_size);
+            const auto tend = std::chrono::high_resolution_clock::now();
+            sync_read_bytes += n_size;
+            read_time += std::chrono::duration_cast<std::chrono::duration<double>>(tend - tbegin).count();
             if (check_tensors) {
                 std::lock_guard<std::mutex> lock(load_mutex);
                 validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
@@ -1206,19 +1268,31 @@ bool llama_model_loader::load_all_data(
 #if defined(GGML_USE_CUDA)
         // If cuda_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
         if (cuda_backend) {
-            file->seek(weight->offs, SEEK_SET);
+            size_t offset = weight->offs;
+            size_t alignment = file->read_alignment();
+            size_t aligned_offset = offset & ~(alignment - 1);
+            size_t offset_from_alignment = offset - aligned_offset;
+            file->seek(aligned_offset, SEEK_SET);
 
             size_t bytes_read = 0;
 
             while (bytes_read < n_size) {
-                size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
+                size_t read_iteration = std::min<size_t>(buffer_size, n_size + offset_from_alignment - bytes_read);
 
                 ggml_backend_event_synchronize(events[thread_idx]);
-                file->read_raw(host_ptrs[thread_idx], read_iteration);
-                ggml_backend_tensor_set_async(cuda_backend, cur, host_ptrs[thread_idx], bytes_read, read_iteration);
+                const auto tbegin = std::chrono::high_resolution_clock::now();
+                file->read_raw_unsafe(host_ptrs[thread_idx], read_iteration);
+                const auto tend = std::chrono::high_resolution_clock::now();
+                sync_read_bytes += read_iteration;
+                read_time += std::chrono::duration_cast<std::chrono::duration<double>>(tend - tbegin).count();
+
+                const auto usable_size = std::min(read_iteration - offset_from_alignment, read_iteration);
+                //printf("[%zu] - [%zu](%zu, %zu) -> [%zu]\n", read_iteration, offset_from_alignment, offset, aligned_offset, usable_size);
+                ggml_backend_tensor_set_async(cuda_backend, cur, reinterpret_cast<std::byte*>(host_ptrs[thread_idx]) + offset_from_alignment, bytes_read, usable_size);
                 ggml_backend_event_record(events[thread_idx]);
 
-                bytes_read += read_iteration;
+                bytes_read += usable_size;
+                offset_from_alignment = 0;
             }
             return n_size;
         }
@@ -1250,8 +1324,11 @@ bool llama_model_loader::load_all_data(
                 read_buf = std::vector<no_init<uint8_t>>();
             }
             read_buf.resize(n_size);
-            file->seek(weight->offs, SEEK_SET);
-            file->read_raw(read_buf.data(), n_size);
+            const auto tbegin = std::chrono::high_resolution_clock::now();
+            file->read_raw_at(read_buf.data(), weight->offs, n_size);
+            const auto tend = std::chrono::high_resolution_clock::now();
+            sync_read_bytes += n_size;
+            read_time += std::chrono::duration_cast<std::chrono::duration<double>>(tend - tbegin).count();
             ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
             if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
@@ -1265,8 +1342,11 @@ bool llama_model_loader::load_all_data(
             std::lock_guard<std::mutex> lock(load_mutex);
             auto & read_buf = read_bufs[thread_idx];
             read_buf.resize(n_size);
-            file->seek(weight->offs, SEEK_SET);
-            file->read_raw(read_buf.data(), n_size);
+            const auto tbegin = std::chrono::high_resolution_clock::now();
+            file->read_raw_at(read_buf.data(), weight->offs, n_size);
+            const auto tend = std::chrono::high_resolution_clock::now();
+            sync_read_bytes += n_size;
+            read_time += std::chrono::duration_cast<std::chrono::duration<double>>(tend - tbegin).count();
             ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
             if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
@@ -1374,16 +1454,39 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        printf("\nloaded all data in [%.2f]s\n", load_time);
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
+                auto & mmap_usages = mmaps_usages.at(idx);
                 auto & mapping = mappings.at(idx);
-                mapping->unmap_fragment(0, mmap_used.first);
-                if (mmap_used.second != 0) {
-                    mapping->unmap_fragment(mmap_used.second, mapping->size());
+                {
+                    const auto addr = reinterpret_cast<const char*>(mapping->addr());
+                    size_t curoff = 0, used = 0;
+                    for (const auto& [off, size] : mmap_usages)
+                    {
+                        used += size;
+                        if (off > curoff)
+                            mapping->unmap_fragment(curoff, off);
+                        curoff = off + size;
+                        //printf("--[%p]~[%p]\n", addr + off, addr+off+size);
+                    }
+                    const auto size = mapping->size();
+                    if (size > curoff)
+                        mapping->unmap_fragment(curoff, size);
+                    printf("unmap [%4u]: in[%12zu], %p, old[%12zu] actual[%12zu] used in [%zu] trunk\n", idx, mapping->size(), addr, mmap_used.second, used, mmap_usages.size());
                 }
+                //mapping->unmap_fragment(0, mmap_used.first);
+                //if (mmap_used.second != 0) {
+                //    mapping->unmap_fragment(mmap_used.second, mapping->size());
+                //}
             }
+        } else {
+            for (const auto & file : files) {
+                file->hint(false, true);
+            }
+            printf("sync read [%zu] bytes in [%.2f]s, avg [%.2f]MB/s\n", sync_read_bytes, read_time, sync_read_bytes / 1048576.0 / read_time);
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor

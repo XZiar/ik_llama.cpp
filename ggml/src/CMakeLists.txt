@@ -164,6 +164,10 @@ if (GGML_OPENMP)
         add_compile_definitions(GGML_USE_OPENMP)
 
         set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+        
+        if (NOT MSVC)
+            set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} libomp.so.5)
+        endif()
 
         if (GGML_MUSA)
             set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} "/usr/lib/llvm-10/include/openmp")
@@ -1316,7 +1320,7 @@ if (WIN32)
 
     if (BUILD_SHARED_LIBS)
         # TODO: should not use this
-        set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        #set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
     endif()
 endif()
 

@@ -4719,6 +4719,33 @@ static bool llm_load_tensors(
         model.tensor_overrides = true;
     }
 
+    std::map<ggml_backend_buffer_type_t, std::vector<std::pair<uint32_t, uint32_t>>, std::less<>> devLayerLookup;
+    for (uint32_t i = 0; i < n_layer; ++i) 
+    {
+        auto& entry = devLayerLookup[model.buft_layer[i].buft];
+        if (!entry.empty() && entry.back().second + 1 == i)
+            entry.back().second++;
+        else
+            entry.emplace_back(i, i);
+    }
+
+    const auto putRegion = [](std::string& dst, auto i, auto j) noexcept
+    {
+        if(!dst.empty())
+            dst.append(", ");
+        dst.append(std::to_string(i));
+        if (i != j)
+            dst.append("-").append(std::to_string(j));
+    };
+
+    for (const auto& [dev, layers] : devLayerLookup)
+    {
+        std::string layer;
+        for (const auto& [i, j] : layers)
+            putRegion(layer, i, j);
+        LLAMA_LOG_INFO("load_tensors: device [%s] assigned layers:%s\n", ggml_backend_buft_name(dev), layer.c_str());
+    }
+
     auto cth = create_tensors_helper_interface::instance(ml, model);
 
     auto ctx_size = cth->get_ctx_size();
@@ -4748,7 +4775,7 @@ static bool llm_load_tensors(
     ml.done_getting_tensors();
 
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
-    ml.init_mappings(!defer_expert_mmap && !dry_run, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
+    ml.init_mappings(false, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
     model.mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -7787,8 +7814,7 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
             size_t offs = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, gguf_find_tensor(ctx_gguf, orig->name));
             size_t size = ggml_nbytes(orig);
             read_buf.resize(size);
-            gguf_file.seek(offs, SEEK_SET);
-            gguf_file.read_raw(read_buf.data(), size);
+            gguf_file.read_raw_at(read_buf.data(), offs, size);
             ggml_backend_tensor_set(dev, read_buf.data(), 0, size);
         };
         for (auto & it : adapter.ab_map) {
@@ -8986,13 +9012,17 @@ struct llama_context * llama_init_from_model(
             ggml_cgraph * gf = llm_build_context::llama_build_graph(*ctx, reserve_batch, true, cparams.worst_graph_tokens);
 
             // initialize scheduler with the worst-case graph
+            ggml_backend_sched_sumamry_name(ctx->sched, "PP");
             bool gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+            ggml_backend_sched_sumamry_name(ctx->sched, nullptr);
             if (!gf_success)
             {
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    ggml_backend_sched_sumamry_name(ctx->sched, "nonPP");
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+                    ggml_backend_sched_sumamry_name(ctx->sched, nullptr);
                 }
                 if (!gf_success) {
                     LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);

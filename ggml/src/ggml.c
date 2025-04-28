@@ -1697,7 +1697,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .row_meta_size            = 4,
     },
     [GGML_TYPE_Q1_0_G128] = {
-        .type_name                = "q1_0_g128",
+        .type_name                = "q1_0",
         .blck_size                = QK1_0_G128,
         .type_size                = sizeof(block_q1_0_g128),
         .is_quantized             = true,
@@ -28624,7 +28624,69 @@ static void clear_numa_thread_affinity(void) {
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(int thread_n) 
+{
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    const char *thr = getenv("ggmlthr");
+    unsigned tid = 0;
+    if (thr == NULL)
+    {
+        // smt
+        const unsigned tid2 = thread_n * 2; 
+        const unsigned smt = (tid2 / info.dwNumberOfProcessors) & 0x1;
+        tid = (tid % info.dwNumberOfProcessors) + smt;
+    }
+    else if (strcmp(thr, "nosmt") == 0)
+    {
+        tid = thread_n % info.dwNumberOfProcessors;
+    }
+    else
+    {
+        tid = thread_n % info.dwNumberOfProcessors;
+        char *copy = strdup(thr);
+        unsigned numbers[128];
+        unsigned count = 0;
+        char *token = strtok(copy, ",");
+        while (token && count < 128u) 
+        {
+            numbers[count++] = atoi(token);
+            token = strtok(NULL, ",");
+        }
+        if (count > 0u)
+        {
+            tid = numbers[thread_n % count];
+        }
+    }
+    GROUP_AFFINITY mask =
+    {
+        .Group = 0,
+        .Mask = (KAFFINITY)(1u) << tid
+    };
+    BOOL ret = SetThreadGroupAffinity(GetCurrentThread(), &mask, NULL);
+    if (ret == 0)
+    {
+        char tmp[2048] = { 0 };
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+            GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            tmp, 2000, NULL);
+        fprintf(stderr, "warning: SetThreadGroupAffinity() failed: %s\n", tmp);
+    }
+    THREAD_POWER_THROTTLING_STATE powerThrottling;
+    ZeroMemory(&powerThrottling, sizeof(powerThrottling));
+    powerThrottling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    powerThrottling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    powerThrottling.StateMask = 0;
+    ret = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &powerThrottling, sizeof(powerThrottling));
+    if (ret == 0)
+    {
+        char tmp[2048] = { 0 };
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+            GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            tmp, 2000, NULL);
+        fprintf(stderr, "warning: SetThreadInformation() failed: %s\n", tmp);
+    }
+}
 static void clear_numa_thread_affinity(void) {}
 #endif
 

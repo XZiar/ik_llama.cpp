@@ -8470,14 +8470,14 @@ bool is_forbidden_tensor(const std::string& name) {
 }
 }
 
-bool iqk_should_modify_tensor([[maybe_unused]] const struct ggml_tensor * tensor) {
+extern "C" IQK_API bool iqk_should_modify_tensor([[maybe_unused]] const struct ggml_tensor * tensor) {
     return false;
     //if (is_forbidden_tensor(tensor->name)) return false;
     //auto mptr = get_modify_info(tensor->type);
     //return mptr ? true : false;
 }
 
-bool iqk_modify_tensor(struct ggml_tensor * tensor) {
+extern "C" IQK_API bool iqk_modify_tensor(struct ggml_tensor * tensor) {
     return false;
     auto mptr = get_modify_info(tensor->type);
     if (!mptr) return false;
@@ -8545,14 +8545,14 @@ const Repack * get_repack_info(ggml_type type) {
 }
 }
 
-int iqk_repacked_type(const struct ggml_tensor * tensor) {
+extern "C" IQK_API int iqk_repacked_type(const struct ggml_tensor * tensor) {
     if (!ggml_is_contiguous(tensor)) return (int)tensor->type;
     if (is_forbidden_tensor(tensor->name)) return (int)tensor->type;
     auto rptr = get_repack_info(tensor->type);
     return rptr && tensor->ne[1] % rptr->num_rows == 0 ? (int)rptr->new_type : (int)tensor->type;
 }
 
-void iqk_repack_tensor(struct ggml_tensor * tensor) {
+extern "C" IQK_API void iqk_repack_tensor(struct ggml_tensor * tensor) {
     constexpr int kChunk = 8;
     if (!tensor) return;
     if (!ggml_is_contiguous(tensor)) return;
@@ -10570,7 +10570,7 @@ bool check_tensor_row_scales(const ggml_tensor * tensor) {
 }
 }
 
-bool iqk_validate_tensor(const ggml_tensor * tensor) {
+extern "C" IQK_API bool iqk_validate_tensor(const ggml_tensor * tensor) {
     if (!tensor) return true;
     if (!ggml_is_contiguous(tensor)) return true;
 
